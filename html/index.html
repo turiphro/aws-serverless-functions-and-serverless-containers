@@ -1,0 +1,126 @@
+<!-- Simple demo page. In reality this should use a framework, like React -->
+<html>
+    <head>
+        <title>Serverless blog</title>
+    </head>
+
+    <body style="background-color: #fafafa;">
+        <div style="background-color: white; max-width: 800px; margin: 10px auto; padding: 10px;">
+            <h1>Welcome at my blog!</h1>
+
+            <div id="urls">
+            </div>
+
+            <div id="posts">
+                loading..
+            </div>
+
+            <div>
+                <br/>
+
+                <button onclick="reloadPosts(); return false;">Reload</button>
+            </div>
+
+            <div id="form">
+                <h3>Add a post</h3>
+                <form id="addForm">
+                    <input type="text" name="id" placeholder="id" style="display:block;">
+                    <input type="text" name="title" placeholder="title" style="display:block;">
+                    <input type="text" name="author" placeholder="author" value="turiphro" style="display:block;">
+                    <textarea name="contents" placeholder="contents" style="display:block;"></textarea>
+                    <br/>
+
+                    <button onclick="addPost(); return false;">Add post</button>
+                </form>
+            </div>
+        </div>
+
+    </body>
+
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js"></script>
+
+    <script type="text/javascript" src="urls.js"></script>
+    <script type="text/javascript">
+        /*
+         * Quick and dirty demo script
+         *
+         * By no means is this meant as production code. Don't try this at -home- work.
+         */
+
+        $(document).ready(function() {
+            reloadURLs();
+            reloadPosts();
+        });
+
+        function reloadURLs() {
+            console.log(urls);
+
+            let urlsElem = $("#urls");
+            urlsElem.append("<h3>URL to use</h3>");
+            urls.forEach(url => {
+                urlsElem.append(`
+                    <label style="display:block;">
+                        <input type="radio" name="url" value="` + url.OutputValue + `" checked onclick="reloadPosts();">
+                    ` + url.OutputKey + ` - <span style="color:grey;">` + url.OutputValue + `</span>
+                    </label>
+                    `)
+            });
+        }
+
+        function getURL() {
+            return $("input[name='url']:checked").val() + "/";
+        }
+
+        function reloadPosts() {
+            let postsElem = $("#posts");
+            postsElem.html("calling api.. " + getURL());
+
+            $.get(getURL() + "blog", function(data, status) {
+                console.log(data, status);
+                let html = data.map(post => `
+                    <div>
+                        <h2>` + post.title + `</h2>
+                        <div><i>by ` + post.author + `</i></div>
+                        <div>` + post.contents.replace("\n", "<br/>\n") + `</div>
+                        <div><i><a href="#" onclick="confirm('Delete this post?') && deletePost('` + post.id + `'); return false;">delete</a></i></div>
+                    </div>
+                    <hr>
+                `);
+
+                postsElem.html(html);
+            });
+        }
+
+        function addPost() {
+            let payload = {};
+            $("#addForm").serializeArray().forEach(field => {
+                payload[field.name] = field.value;
+            });
+            console.log(payload);
+
+            $.ajax({
+                url: getURL() + "blog",
+                type: 'POST',
+                data: JSON.stringify(payload),
+                contentType: "application/json",
+                success: function(data, status) {
+                    console.log(data);
+                    reloadPosts();
+                }
+            });
+        }
+
+        function deletePost(id) {
+            $.ajax({
+                url: getURL() + "blog/" + id,
+                type: 'DELETE',
+                success: function(data, status) {
+                    console.log(data);
+
+                    reloadPosts();
+                }
+            });
+        }
+
+    </script>
+</html>

@@ -1,0 +1,3 @@
+boto3       # both (but preinstalled on Lambda)
+flask       # fargate service only
+flask-cors  # fargate service only

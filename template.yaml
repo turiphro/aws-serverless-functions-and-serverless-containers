@@ -1,0 +1,356 @@
+# CloudFormation / SAM template to create a serverless application.
+# Two architectures are included, both using the same DynamoDB table and static frontend:
+# 1. Lambdas ('serverless' functions)  -> implemented below
+# 2. Fargate ('serverless' containers) -> Todo, pretty involved
+#
+# Created: 2019-12-19
+# Author: turiphro
+# 
+# Install: pip3 install awscli boto3 aws-sam-cli
+# Create with:
+#   sam validate
+#   sam build
+#
+#   # 1) test locally, behind full API
+#   # note: can keep the API running, just run 'sam build' after changes
+#   sam local start-api             # -> set URL in index.html or call manually:
+#   http GET http://127.0.0.1:3000/blog/foo
+#   # test locally, raw call w/h API
+#   sam local invoke GetBlog --event <(echo '{"id": "foo"}') | jq .
+#
+#   # 2) test locally, Docker container
+#   export TABLE_NAME=$SOME_DYNAMODB_TABLE
+#   docker build -t blog .
+#   docker run -it -p 5000:80 -v $PWD/src:/app -v ~/.aws:/root/.aws -e TABLE_NAME blog
+#
+#   # deploy:
+#   sam deploy --guided
+#
+#   # update urls in index.html, open locally
+#
+# This example is mostly from scratch, but with some help from:
+# - https://aws.amazon.com/blogs/compute/introducing-simplified-serverless-application-deplyoment-and-management/
+# - https://github.com/nathanpeck/aws-cloudformation-fargate
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+    Api:
+        Cors:
+            AllowOrigin: "'*'"
+            AllowHeaders: "'Access-Control-Allow-Headers, Origin, Accept, X-Requested-With, Content-Type, Access-Control-Request-Method, Access-Control-Request-Headers, Authorization'" 
+
+
+Parameters:
+    DockerImage:
+        Type: String
+        Description: Docker image location (push first, then pass in)
+        Default: turiphro/fargate-blog
+    
+Outputs:
+    FunctionsURL:
+        Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+        Description: URL for API gateway (Lambda functions) endpoint
+    ContainersURL:
+        Value: !Join ['', ['http://', !GetAtt FargateLoadBalancer.DNSName]]
+        Description: URL for load balancer (Fargate containers) endpoint
+
+Resources:
+    ## Shared table
+    BlogTable:
+        Type: AWS::Serverless::SimpleTable
+        Name: ServerlessBlog
+        Properties:
+            PrimaryKey:
+                Name: id
+                Type: String
+
+
+    ## 1. Serverless functions route
+    GetBlogs:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: src.functions.get_all
+            Runtime: python3.7
+            Policies:
+                - AmazonDynamoDBReadOnlyAccess
+                - AmazonAPIGatewayPushToCloudWatchLogs
+            Environment:
+                Variables:
+                    TABLE_NAME: !Ref BlogTable
+            Events:
+                GetResource:
+                    Type: Api
+                    Properties:
+                        Path: /blog
+                        Method: get
+
+    GetBlog:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: src.functions.get
+            Runtime: python3.7
+            Policies:
+                - AmazonDynamoDBReadOnlyAccess
+                - AmazonAPIGatewayPushToCloudWatchLogs
+            Environment:
+                Variables:
+                    TABLE_NAME: !Ref BlogTable
+            Events:
+                GetResource:
+                    Type: Api
+                    Properties:
+                        Path: /blog/{id}
+                        Method: get
+
+    PostBlog:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: src.functions.post
+            Runtime: python3.7
+            Policies:
+                - AmazonDynamoDBFullAccess # note: needs write access
+                - AmazonAPIGatewayPushToCloudWatchLogs
+            Environment:
+                Variables:
+                    TABLE_NAME: !Ref BlogTable
+            Events:
+                GetResource:
+                    Type: Api
+                    Properties:
+                        Path: /blog
+                        Method: post
+
+    DeleteBlog:
+        Type: AWS::Serverless::Function
+        Properties:
+            Handler: src.functions.delete
+            Runtime: python3.7
+            Policies:
+                - AmazonDynamoDBFullAccess
+                - AmazonAPIGatewayPushToCloudWatchLogs
+            Environment:
+                Variables:
+                    TABLE_NAME: !Ref BlogTable
+            Events:
+                GetResource:
+                    Type: Api
+                    Properties:
+                        Path: /blog/{id}
+                        Method: delete
+
+
+    ## 2. Fargate route
+    
+    # Fargate CloudFormation templates are very (!) involved.
+    # Fargate services need a VPC, Cluster, LoadBalancer, TaskDefinition, and manually
+    # building & pushing containers to a (private?) AWS container repository.
+    # Definitely want to start from a template.
+    # Skipping for now.
+    #
+    # Examples:
+    # - https://github.com/aws-samples/startup-kit-templates/blob/master/vpc-bastion-fargate.cfn.yml
+    # - https://github.com/nathanpeck/aws-cloudformation-fargate
+
+    FargateCluster:
+        Type: AWS::ECS::Cluster
+
+    FargateTaskDefinition:
+        Type: AWS::ECS::TaskDefinition
+        Properties:
+            NetworkMode: awsvpc # only supported mode for Fargate
+            Memory: 512
+            Cpu: 256
+            RequiresCompatibilities:
+                - FARGATE
+            TaskRoleArn: !Ref FargateTaskRole
+            ContainerDefinitions:
+                - Name: blog-container
+                  Image: !Ref DockerImage
+                  PortMappings:
+                      - ContainerPort: 80
+                  Environment:
+                      - Name: "TABLE_NAME"
+                        Value: !Ref BlogTable
+                      - Name: "WERKZEUG_DEBUG_PIN"
+                        Value: "off"
+
+    FargateService:
+        Type: AWS::ECS::Service
+        DependsOn:
+            - FargateLoadBalancerListener
+        Properties:
+            ServiceName: blog-service
+            Cluster: !Ref FargateCluster
+            TaskDefinition: !Ref FargateTaskDefinition
+            LaunchType: FARGATE
+            DesiredCount: 3
+            NetworkConfiguration:
+                AwsvpcConfiguration:
+                    AssignPublicIp: ENABLED
+                    Subnets:
+                        # In production, this should be multiple private subnets
+                        - !Ref FargateSubnet1
+                        - !Ref FargateSubnet2
+                    SecurityGroups:
+                        - !Ref FargateSecurityGroup
+            LoadBalancers:
+                - ContainerName: blog-container
+                  ContainerPort: 80
+                  TargetGroupArn: !Ref FargateTargetGroup
+    # In production, a AWS::ApplicationAutoScaling::ScalingPolicy should be added (now 3 instances).
+
+    FargateTaskRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                      Service: [ecs-tasks.amazonaws.com]
+                    Action: ['sts:AssumeRole']
+            Policies:
+                - PolicyName: ECSDynamodbPolicy
+                  PolicyDocument:
+                      Statement:
+                          - Effect: Allow
+                            Resource: "*"
+                            Action:
+                              - dynamodb:GetItem
+                              - dynamodb:PutItem
+                              - dynamodb:DeleteItem
+                              - dynamodb:UpdateItem
+                              - dynamodb:Query
+                              - dynamodb:Scan
+                              - dynamodb:BatchGetItem
+                              - dynamodb:BatchWriteItem
+
+
+    # Load balancer in front of the containers (inside the VPC below)
+    FargateLoadBalancer:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Scheme: internet-facing
+            LoadBalancerAttributes:
+                - Key: idle_timeout.timeout_seconds
+                  Value: '30'
+            Subnets:
+                - !Ref FargateSubnet1
+                - !Ref FargateSubnet2
+            SecurityGroups:
+                - !Ref FargateLoadBalancerSecurityGroup
+
+    FargateLoadBalancerSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupName: "Fargate LB public firewall"
+            GroupDescription: "inbound from anywhere"
+            VpcId: !Ref FargateVPC
+            SecurityGroupIngress:
+              - IpProtocol: -1
+                CidrIp: 0.0.0.0/0
+
+    FargateTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            TargetType: ip
+            Protocol: HTTP
+            Port: 80
+            VpcId: !Ref FargateVPC
+
+    FargateLoadBalancerListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        DependsOn:
+            - FargateLoadBalancer
+        Properties:
+            LoadBalancerArn: !Ref FargateLoadBalancer
+            Port: 80
+            Protocol: HTTP  # In production, this should be HTTPS with a Certificate
+            DefaultActions:
+                - Type: forward
+                  TargetGroupArn: !Ref FargateTargetGroup
+
+
+    # A whole lot of VPC config is needed,
+    # including access inbound (requests) and outbound (fetch Docker container)
+    FargateVPC:
+        Type: AWS::EC2::VPC
+        Properties:
+            CidrBlock: 10.0.0.0/16
+
+    FargateInternetGateway:
+        Type: AWS::EC2::InternetGateway
+
+    FargateInternetAttachment:
+        Type: AWS::EC2::VPCGatewayAttachment
+        Properties:
+            VpcId: !Ref FargateVPC
+            InternetGatewayId: !Ref FargateInternetGateway
+
+    # In production, we should add more subnets in multiple
+    # availability zones (availability), and move the containers
+    # to private subnets (security)
+    FargateSubnet1:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref FargateVPC
+            CidrBlock: 10.0.16.0/20
+            MapPublicIpOnLaunch: true
+            AvailabilityZone:
+                Fn::Select:
+                    - 0
+                    - Fn::GetAZs: {Ref: 'AWS::Region'}
+
+    FargateSubnet2:
+        Type: AWS::EC2::Subnet
+        Properties:
+            VpcId: !Ref FargateVPC
+            CidrBlock: 10.0.32.0/20
+            MapPublicIpOnLaunch: true
+            AvailabilityZone:
+                Fn::Select:
+                    - 1
+                    - Fn::GetAZs: {Ref: 'AWS::Region'}
+
+    FargateRouteTable:
+        Type: AWS::EC2::RouteTable
+        Properties:
+            VpcId: !Ref FargateVPC
+
+    FargateInternetRoute:
+        Type: AWS::EC2::Route
+        DependsOn: FargateInternetAttachment
+        Properties:
+            DestinationCidrBlock: 0.0.0.0/0
+            GatewayId: !Ref FargateInternetGateway
+            RouteTableId: !Ref FargateRouteTable
+
+    FargateRouteTableAssociation1:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref FargateRouteTable
+            SubnetId: !Ref FargateSubnet1
+
+    FargateRouteTableAssociation2:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+            RouteTableId: !Ref FargateRouteTable
+            SubnetId: !Ref FargateSubnet2
+
+    FargateSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupName: "Fargate firewall"
+            GroupDescription: "inbound to 80, outbound to anything"
+            VpcId: !Ref FargateVPC
+            SecurityGroupIngress: # In production, this should only accept traffic from the load balancer
+              - IpProtocol: tcp
+                FromPort: '80'
+                ToPort: '80'
+                CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+              - IpProtocol: -1
+                CidrIp: 0.0.0.0/0
+
