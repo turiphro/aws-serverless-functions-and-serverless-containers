@@ -9,4 +9,4 @@ WORKDIR /app
 EXPOSE 80
 
 # Note: in production, we should front Flask with a production (WSGI) server
-CMD python fargate.py
+CMD python containers.py
